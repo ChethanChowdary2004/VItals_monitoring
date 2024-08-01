@@ -1,0 +1,145 @@
+from machine import SoftI2C, Pin
+from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
+from ssd1306 import SSD1306_I2C
+import utime 
+import time
+from hx711 import HX711
+from mpu6050 import accel
+import urequests
+import math
+import machine
+
+# Set
+i2c = SoftI2C(sda=Pin(22), scl=Pin(21), freq=400000)
+
+
+# Initialize MAX30102 sensor
+max30102 = MAX30102(i2c=i2c)
+if max30102.i2c_address not in i2c.scan():
+    print("MAX30102 not found.")
+    while True:
+        pass
+max30102.setup_sensor()
+
+# Configure sensor settings
+max30102.set_sample_rate(100)
+max30102.set_fifo_average(4)
+max30102.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
+
+red = max30102.pop_red_from_storage()
+ir = max30102.pop_ir_from_storage()
+
+def calculate_spo2(red, ir):
+    # Calculate the ratio of red to infrared light
+    ratio = float(red) / float(ir) if ir != 0 else 0
+
+    # Calculate the SPo2 using the ratio and the empirical calibration curves
+    if ratio < 0.3:
+        spo2 = (-25.722 * math.pow(ratio, 2)) + (25.744 * ratio) + 94.845
+    elif ratio < 0.4:
+        spo2 = (-0.3629 * math.pow(ratio, 3)) + (1.096 * math.pow(ratio, 2)) - (0.7017 * ratio) + 109.38
+    elif ratio < 0.5:
+        spo2 = (-4.342 * math.pow(ratio, 3)) + (6.8554 * math.pow(ratio, 2)) - (2.7568 * ratio) + 100.34
+    elif ratio < 0.6:
+        spo2 = (-16.141 * math.pow(ratio, 3)) + (27.23 * math.pow(ratio, 2)) - (13.68 * ratio) + 94.845
+    else:
+        spo2 = (-63.669 * math.pow(ratio, 3)) + (101.49 * math.pow(ratio, 2)) - (48.661 * ratio) + 110.4
+
+    return spo2
+
+def calculate_bpm(ir):
+    # Calculate the heart rate using a Fourier transform and the sample rate of the MAX30102 sensor
+    sample_rate = 100  # Hz
+    fft_size = 512
+    fft = np.fft.fft(ir[-fft_size:])
+    freqs = np.fft.fftfreq(fft_size, 1 / sample_rate)
+    bpm = abs(freqs[np.argmax(abs(fft.real))]) * 60
+
+    return bpm
+
+# define the pins for the HX711 module
+DT = 16
+SCK = 4
+
+# define the calibration factor for the load cell
+CALIBRATION_FACTOR = 6990.5
+
+# initialize the pins
+dt_pin = machine.Pin(DT, machine.Pin.IN)
+sck_pin = machine.Pin(SCK, machine.Pin.OUT)
+
+# function to read the raw data from the HX711 module
+def read():
+    # wait for the HX711 module to become ready
+    while dt_pin.value():
+        pass
+
+    # initialize the variables
+    count = 0
+    data = bytearray(3)
+
+    # read 24 bits of data from the HX711 module
+    for i in range(24):
+        sck_pin.value(1)
+        utime.sleep_us(1)
+        count <<= 1
+        count |= dt_pin.value()
+        sck_pin.value(0)
+        utime.sleep_us(1)
+
+    # check if the data is negative
+    if count & 0x800000:
+        count |= ~0xffffff
+
+    # reverse the byte order
+    data[2] = count & 0xff
+    data[1] = (count >> 8) & 0xff
+    data[0] = (count >> 16) & 0xff
+    # return the data
+    return data
+# function to read the weight from the load cell
+def read_weight():
+    # read the raw data from the HX711 module
+    data = read()
+    # convert the raw data to a signed integer
+    reading = int.from_bytes(data, "big")
+    # calculate the weight in grams
+    weight = reading / CALIBRATION_FACTOR
+    # return the weight in grams
+    return weight
+#OLED DISPLAY
+oled_width = 128
+oled_height = 32
+oled = SSD1306_I2C(oled_width, oled_height, i2c)
+# Read RED and IR data
+while True:
+    max30102.check()
+    if max30102.available():
+        Red = max30102.pop_red_from_storage()
+        Ir = max30102.pop_ir_from_storage()
+        print("RED: ", red, "IR: ", ir)
+        # Read temperature
+        temp = max30102.read_temperature()
+        print("Temperature: ", temp)
+        
+        #get spo2 values
+        spo2 = calculate_spo2(red,ir)
+        print("Spo2; ",spo2)
+        
+        # read the weight from the load cell
+        weight = read_weight()
+
+    # print the weight
+        print("Weight: {:.2f} g".format(weight))
+        oled.fill(0)
+        # Print the SPO2 and BPM readings on the OLED display
+        #oled.text("Weight: " + str(weight),0,0)
+        #oled.text("weight: " + str(weight),0,0)
+        oled.text("weight: " + str(weight),0,0)
+        oled.text("IR: " + str(Ir), 0, 8)
+        oled.text("Temp: " + str(temp),0 , 16)
+        oled.text("Spo2: " + str(spo2),0 , 24)
+        # Update the OLED display
+        oled.show()
+        # Wait for a moment
+        time.sleep(0.1)
